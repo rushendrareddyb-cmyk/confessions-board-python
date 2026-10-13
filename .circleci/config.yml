@@ -2,63 +2,154 @@
 version: 2.1
 
 jobs:
-  build-and-test:
+  validate:
     docker:
-      - image: cimg/python:3.11
+      - image: cimg/python:3.12
+        environment:
+          DATABASE_URL: postgresql://confessions:ci_password@127.0.0.1:5432/confessions
+          REDIS_URL: redis://127.0.0.1:6379
+      - image: postgres:16-alpine
+        environment:
+          POSTGRES_USER: confessions
+          POSTGRES_PASSWORD: ci_password
+          POSTGRES_DB: confessions
+      - image: redis:7-alpine
+
     steps:
       - checkout
 
       - run:
-          name: Install dependencies
-          command: pip install -r requirements.txt
+          name: Install system tools
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client curl
 
       - run:
-          name: Check Python files
-          command: python -m compileall -q app
+          name: Install Python dependencies
+          command: |
+            pip install -r requirements.txt
+            pip install pytest httpx ruff redis
 
       - run:
-          name: Install test dependencies
-          command: pip install pytest httpx
+          name: Wait for PostgreSQL and Redis
+          command: |
+            for i in $(seq 1 30); do
+              if pg_isready -h 127.0.0.1 -U confessions -d confessions; then
+                break
+              fi
+              sleep 2
+            done
+            pg_isready -h 127.0.0.1 -U confessions -d confessions
+            python -c "import redis,time; r=redis.Redis(host='127.0.0.1',port=6379); [(r.ping()) for _ in range(1)]"
 
       - run:
-          name: Run automated tests
+          name: Apply database migrations
+          command: |
+            export PGPASSWORD=ci_password
+            for f in migrations/*.sql; do
+              echo "Applying $f"
+              psql -h 127.0.0.1 -U confessions -d confessions \
+                -v ON_ERROR_STOP=1 -f "$f"
+            done
+
+      - run:
+          name: Scan for secrets with Gitleaks
+          command: |
+            curl -sSfL \
+              https://github.com/gitleaks/gitleaks/releases/download/v8.24.2/gitleaks_8.24.2_linux_x64.tar.gz \
+              -o /tmp/gitleaks.tar.gz
+            tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+            /tmp/gitleaks detect --source . --redact --log-opts="--all"
+
+      - run:
+          name: Check Python syntax
+          command: python -m compileall -q app tests
+
+      - run:
+          name: Ruff lint
+          command: ruff check app tests
+
+      - run:
+          name: Run unit and integration tests
           command: python -m pytest -v
 
-  build-and-push:
+  publish-image:
+    parameters:
+      moving_tag:
+        type: string
+      branch_tag:
+        type: string
+
     docker:
       - image: cimg/base:stable
+
     steps:
       - checkout
-
       - setup_remote_docker
 
       - run:
           name: Login to Docker Hub
           command: |
             echo "$DOCKERHUB_TOKEN" | docker login \
-              --username "$DOCKERHUB_USERNAME" \
+              --username "$DOCKERHUB_USER" \
               --password-stdin
 
       - run:
-          name: Build Docker image
+          name: Build and publish image tags
           command: |
-            docker build \
-              -t "$DOCKERHUB_USERNAME/confessions-board-python:latest" .
+            IMAGE="$DOCKERHUB_USER/confessions-board-python"
+            SHORT_SHA=$(echo "$CIRCLE_SHA1" | cut -c1-7)
 
-      - run:
-          name: Push Docker image
-          command: |
-            docker push \
-              "$DOCKERHUB_USERNAME/confessions-board-python:latest"
+            docker build \
+              -t "$IMAGE:<< parameters.moving_tag >>" \
+              -t "$IMAGE:<< parameters.branch_tag >>-$SHORT_SHA" .
+
+            docker push "$IMAGE:<< parameters.moving_tag >>"
+            docker push "$IMAGE:<< parameters.branch_tag >>-$SHORT_SHA"
 
 workflows:
-  test-and-publish:
+  main-qa:
     jobs:
-      - build-and-test
-
-      - build-and-push:
-          requires:
-            - build-and-test
+      - validate:
           filters:
             branches:
               only: main
+
+      - publish-image:
+          name: publish-qa
+          moving_tag: qa
+          branch_tag: main
+          requires:
+            - validate
+          filters:
+            branches:
+              only: main
+
+  staging:
+    jobs:
+      - publish-image:
+          name: publish-stage
+          moving_tag: stage
+          branch_tag: staging
+          filters:
+            branches:
+              only: staging
+
+  production:
+    jobs:
+      - publish-image:
+          name: publish-prod
+          moving_tag: prod
+          branch_tag: prod
+          filters:
+            branches:
+              only: prod
+
+
+  feature-validation:
+    jobs:
+      - validate:
+          filters:
+            branches:
+              only: /^feature\/.*/
+
