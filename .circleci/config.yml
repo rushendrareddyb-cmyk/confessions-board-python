@@ -28,8 +28,7 @@ jobs:
           name: Install Python dependencies
           command: |
             pip install -r requirements.txt
-            pip install pytest httpx ruff redis
-
+            pip install pytest httpx ruff redis pytest-cov
       - run:
           name: Wait for PostgreSQL and Redis
           command: |
@@ -71,7 +70,7 @@ jobs:
 
       - run:
           name: Run unit and integration tests
-          command: python -m pytest -v
+          command: python -m pytest --cov=app --cov-report=term-missing -v
 
   publish-image:
     parameters:

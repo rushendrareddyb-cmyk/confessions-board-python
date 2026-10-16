@@ -97,10 +97,26 @@ Redis holds everything that would otherwise identify somebody. The rate-limit co
 
 ## The hard part
 
-Anonymous but not unaccountable. You must stop abuse without storing anything that identifies who wrote what.
+## Privacy, Abuse Prevention, and Accountability
 
-Write your answer in your README. It is worth more marks than the feature.
+The goal of this project is to allow anonymous participation while preventing spam and abuse without unnecessarily storing identifying information.
 
+### How the design works
+
+- **Device-based rate limiting:** Requests use the `X-Device-Id` header. The design uses a salted hash for rate-limit keys rather than using the raw device identifier as the key. Redis stores temporary counters with an expiry.
+- **Preventing duplicate votes:** Redis uses an expiring `SET NX EX` marker to prevent a device from repeatedly voting on the same post.
+- **Content moderation:** Posts that match blocked terms are held for review instead of being published immediately.
+- **Community reporting:** Published posts can be reported. Once the required threshold is reached, a post can return to the moderation queue.
+- **Human review:** Moderators can approve or reject held posts using the moderation API.
+- **Separation of responsibilities:** PostgreSQL stores the application's persistent data, while Redis supports temporary rate limits, vote tracking, and live vote counts.
+
+### Why this approach matters
+
+Anonymity should not mean that abuse goes unchecked. Rate limits, vote restrictions, content filtering, community reporting, and human moderation provide safeguards without requiring users to create personal profiles.
+
+The system still has limitations. A device identifier is not proof of a person's real-world identity, and users may try to bypass device-based restrictions. Moderation thresholds can also produce false positives or false negatives. The design therefore combines automated checks with moderator decisions rather than relying on a single control.
+
+The objective is to minimize the collection of identifying information while keeping the service usable, fair, and resistant to abuse.
 ---
 
 ## Getting unstuck
@@ -113,12 +129,76 @@ Write your answer in your README. It is worth more marks than the feature.
 | Build takes minutes each time | `COPY . .` is above your dependency install. |
 | CI cannot reach the database | In CircleCI service containers the host **is** `localhost` — opposite of compose. |
 
+
+## Kubernetes Deployment and Verification
+
+The project has three Kubernetes namespaces in the local Minikube cluster:
+
+- `qa` — QA environment
+- `stage` — staging environment
+- `prod` — production namespace in the local cluster
+
+### Apply the environment manifests
+
+From the repository root, apply the manifest for the environment you intend to update:
+
+```powershell
+kubectl apply -f .\k8s\qa.yaml
+kubectl apply -f .\k8s\stage.yaml
+kubectl apply -f .\k8s\prod.yaml
+```
+
+Apply these individually and verify each rollout before moving to the next environment.
+
+### Verify deployments
+
+```powershell
+kubectl get pods -n qa
+kubectl get deployments -n qa
+
+kubectl get pods -n stage
+kubectl get deployments -n stage
+
+kubectl get pods -n prod
+kubectl get deployments -n prod
+```
+
+The application, PostgreSQL, and Redis deployments should be ready. Database migration jobs may show `Completed`, which is expected after a successful migration.
+
+### Verify the health endpoint
+
+Port-forward the service to a local port. Run the appropriate command in a separate terminal and keep it running during testing:
+
+```powershell
+kubectl port-forward -n qa svc/confessions-board 8080:80
+```
+
+Then test the endpoint:
+
+```powershell
+Invoke-RestMethod http://localhost:8080/health
+Invoke-RestMethod "http://localhost:8080/posts?limit=5"
+```
+
+The health response should report `status: ok`, with PostgreSQL and Redis connectivity set to `true`.
+
+Use separate local ports when testing multiple environments simultaneously.
+
+### PostgreSQL rollout strategy
+
+The PostgreSQL Deployments use the `Recreate` strategy to prevent the old database pod from overlapping with its replacement during a Deployment rollout. A replacement can cause a temporary interruption while PostgreSQL starts.
+
+The web application uses readiness and liveness probes against `/health`. The current configuration uses a 3-second timeout, a 10-second readiness initial delay, and a 30-second liveness initial delay.
+
+**Environment note:** `prod` refers to the Production namespace in the local Minikube cluster. It is not a separate external production server.
+
 ## CI/CD Pipeline
 
-This project uses CircleCI for Continuous Integration (CI).
 
-- Automatically runs the build pipeline when changes are pushed to GitHub.
-- Installs the required Python dependencies.
-- Checks Python files for syntax errors.
+CircleCI is used for continuous integration. The repository contains its pipeline configuration at `.circleci/config.yml`.
 
-**Status:** CircleCI pipeline testing in progress.
+The project pipeline is intended to validate code quality, run unit and integration tests, scan for accidentally committed secrets, and build the application image.
+
+The latest pipeline runs checked for the PostgreSQL deployment-strategy pull request and its merge into `staging` completed successfully, as verified in CircleCI.
+
+**Note:** Pipeline status can change with later commits. Check CircleCI for the current status before merging changes or submitting the project.
